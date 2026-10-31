@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -373,4 +374,108 @@ func TestStreamCustomKeyToList(t *testing.T) {
 	}
 	require.NoError(t, stream.Orchestrate(ctxb))
 	require.Zero(t, len(res))
+}
+
+// A stream created from a read-only transaction reads its snapshot in every goroutine: the keys
+// set, changed or deleted after the transaction began are read as they were then.
+func TestStreamReadsTheSnapshotOfItsTxn(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		prefixes := []string{"p0", "p1", "p2", "p3"}
+		for _, prefix := range prefixes {
+			require.NoError(t, db.Update(func(txn *Txn) error {
+				for i := 1; i <= 100; i++ {
+					if err := txn.Set(keyWithPrefix(prefix, i), value(i)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}))
+		}
+		snapshot := db.NewTransaction(false)
+		defer snapshot.Discard()
+		require.NoError(t, db.Update(func(txn *Txn) error {
+			for _, prefix := range prefixes {
+				if err := txn.Set(keyWithPrefix(prefix, 1), []byte("changed")); err != nil {
+					return err
+				}
+				if err := txn.Set(keyWithPrefix(prefix, 101), value(101)); err != nil {
+					return err
+				}
+				if err := txn.Delete(keyWithPrefix(prefix, 2)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}))
+
+		stream := snapshot.NewStream()
+		c := &collector{}
+		stream.Send = c.Send
+		require.NoError(t, stream.Orchestrate(ctxb))
+		require.Len(t, c.kv, 400)
+		for _, kv := range c.kv {
+			_, i := keyToInt(kv.Key)
+			require.Equal(t, value(i), kv.Value, "%s", kv.Key)
+			require.LessOrEqual(t, kv.Version, snapshot.ReadTs())
+		}
+	})
+}
+
+// A stream does not read a transaction discarded: the versions it read may be gone.
+func TestStreamRefusesADiscardedTxn(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		snapshot := db.NewTransaction(false)
+		stream := snapshot.NewStream()
+		snapshot.Discard()
+		stream.Send = (&collector{}).Send
+		require.ErrorIs(t, stream.Orchestrate(ctxb), ErrDiscardedTxn)
+	})
+}
+
+// The goroutines of a stream created from the DB read at one read timestamp, that of the snapshot
+// taken when Orchestrate starts, while commits go on: a commit landing between the starts of two
+// of them is read by none.
+func TestStreamReadsOneSnapshotWhileCommitsGoOn(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		for i := 1; i <= 2000; i++ {
+			require.NoError(t, db.Update(func(txn *Txn) error {
+				return txn.Set(keyWithPrefix(fmt.Sprintf("p%d", i%16), i), value(i))
+			}))
+		}
+		stop := make(chan struct{})
+		written := make(chan error, 1)
+		go func() {
+			for i := 1; ; i++ {
+				select {
+				case <-stop:
+					written <- nil
+					return
+				default:
+				}
+				if err := db.Update(func(txn *Txn) error {
+					return txn.Set(keyWithPrefix("later", i), value(i))
+				}); err != nil {
+					written <- err
+					return
+				}
+			}
+		}()
+		for range 20 {
+			var mu sync.Mutex
+			readTs := map[uint64]bool{}
+			stream := db.NewStream()
+			stream.NumGo = 16
+			stream.KeyToList = func(key []byte, itr *Iterator) (*bpb.KVList, error) {
+				mu.Lock()
+				readTs[itr.readTs] = true
+				mu.Unlock()
+				return stream.ToList(key, itr)
+			}
+			stream.Send = (&collector{}).Send
+			require.NoError(t, stream.Orchestrate(ctxb))
+			require.Len(t, readTs, 1, "the goroutines read at one timestamp")
+		}
+		close(stop)
+		require.NoError(t, <-written)
+	})
 }
