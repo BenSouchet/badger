@@ -32,7 +32,9 @@ var maxStreamSize = uint64(100 << 20) // 100MB
 // Stream provides a framework to concurrently iterate over a snapshot of Badger, pick up
 // key-values, batch them up and call Send. Stream does concurrent iteration over many smaller key
 // ranges. It does NOT send keys in lexicographical sorted order. To get keys in sorted
-// order, use Iterator.
+// order, use Iterator. All the goroutines of a Stream read the same snapshot: that of its read
+// timestamp in managed mode (NewStreamAt), else that of the read-only transaction it was created
+// from (Txn.NewStream), or of one taken when Orchestrate starts (NewStream).
 type Stream struct {
 	// Prefix to only iterate over certain range of keys. If set to nil (default), Stream would
 	// iterate over the entire DB.
@@ -89,8 +91,11 @@ type Stream struct {
 	Send func(buf *z.Buffer) error
 
 	// Read data above the sinceTs. All keys with version =< sinceTs will be ignored.
-	SinceTs      uint64
-	readTs       uint64
+	SinceTs uint64
+	readTs  uint64
+	// snapshot is the read-only transaction whose read timestamp the goroutines read at, in a DB
+	// not managed: it keeps the versions they read from the compactions.
+	snapshot     *Txn
 	db           *DB
 	rangeCh      chan keyRange
 	kvChan       chan *z.Buffer
@@ -174,12 +179,7 @@ func (st *Stream) produceKVs(ctx context.Context, threadId int) error {
 	st.numProducers.Add(1)
 	defer st.numProducers.Add(-1)
 
-	var txn *Txn
-	if st.readTs > 0 {
-		txn = st.db.NewTransactionAt(st.readTs, false)
-	} else {
-		txn = st.db.NewTransaction(false)
-	}
+	txn := st.newTxn()
 	defer txn.Discard()
 
 	// produceKVs is running iterate serially. So, we can define the outList here.
@@ -413,6 +413,21 @@ outer:
 // are serial. In case any of these steps encounter an error, Orchestrate would stop execution and
 // return that error. Orchestrate can be called multiple times, but in serial order.
 func (st *Stream) Orchestrate(ctx context.Context) error {
+	if !st.db.opt.managedTxns {
+		switch {
+		case st.snapshot == nil:
+			// The snapshot of the stream: each goroutine reading the DB as it was when it started,
+			// a commit landing between two of them would be read by some only.
+			txn := st.db.NewTransaction(false)
+			st.snapshot = txn
+			defer func() {
+				st.snapshot = nil
+				txn.Discard()
+			}()
+		case st.snapshot.discarded:
+			return ErrDiscardedTxn
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	st.rangeCh = make(chan keyRange, 3) // Contains keys for posting lists.
@@ -476,6 +491,20 @@ func (st *Stream) Orchestrate(ctx context.Context) error {
 	return err
 }
 
+// newTxn returns the transaction a goroutine of the stream reads with, at the read timestamp of
+// the stream.
+func (st *Stream) newTxn() *Txn {
+	if st.snapshot == nil {
+		return st.db.NewTransactionAt(st.readTs, false)
+	}
+	// The snapshot holds the read mark of its read timestamp: the transaction of a goroutine reads
+	// at it without a mark of its own to release.
+	txn := st.db.newTransaction(false, true)
+	txn.readTs = st.snapshot.readTs
+	txn.doneRead = true
+	return txn
+}
+
 func (db *DB) newStream() *Stream {
 	return &Stream{
 		db:        db,
@@ -485,12 +514,27 @@ func (db *DB) newStream() *Stream {
 	}
 }
 
-// NewStream creates a new Stream.
+// NewStream creates a new Stream, which reads the snapshot of the DB taken when Orchestrate starts.
 func (db *DB) NewStream() *Stream {
 	if db.opt.managedTxns {
 		panic("This API can not be called in managed mode.")
 	}
 	return db.newStream()
+}
+
+// NewStream creates a new Stream reading the snapshot of txn, a read-only transaction: every
+// goroutine of the stream reads at the read timestamp of txn, which must not be discarded before
+// the stream is done. Should only be used with a DB not managed (else NewStreamAt).
+func (txn *Txn) NewStream() *Stream {
+	if txn.db.opt.managedTxns {
+		panic("This API can not be called in managed mode.")
+	}
+	if txn.update {
+		panic("A stream reads a read-only transaction.")
+	}
+	stream := txn.db.newStream()
+	stream.snapshot = txn
+	return stream
 }
 
 // NewStreamAt creates a new Stream at a particular timestamp. Should only be used with managed DB.
