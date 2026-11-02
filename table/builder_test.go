@@ -269,6 +269,30 @@ func TestBloomfilter(t *testing.T) {
 		createAndTest(t, false)
 	})
 }
+
+// A builder of a small table allocates what it holds rather than twice the table size, and a builder
+// of a full table still builds it.
+func TestBuilderAllocatesWhatItsTableHolds(t *testing.T) {
+	opts := getTestTableOptions()
+	opts.TableSize = 64 << 20
+	small := NewTableBuilder(opts)
+	defer small.Close()
+	for i := 0; i < 100; i++ {
+		small.Add(y.KeyWithTs([]byte(fmt.Sprintf("key%05d", i)), 1), y.ValueStruct{Value: []byte("value")}, 0)
+	}
+	require.Less(t, small.alloc.Allocated(), uint64(opts.TableSize))
+	require.NotEmpty(t, small.Finish())
+
+	opts.TableSize = 4 << 20
+	full := NewTableBuilder(opts)
+	defer full.Close()
+	value := make([]byte, 1000)
+	for i := 0; !full.ReachedCapacity(); i++ {
+		full.Add(y.KeyWithTs([]byte(fmt.Sprintf("key%08d", i)), 1), y.ValueStruct{Value: value}, 0)
+	}
+	require.Greater(t, len(full.Finish()), int(opts.TableSize/2))
+}
+
 func TestEmptyBuilder(t *testing.T) {
 	opts := Options{BloomFalsePositive: 0.1}
 	b := NewTableBuilder(opts)
