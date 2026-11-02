@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -786,4 +787,68 @@ func TestStreamWriterIncremental(t *testing.T) {
 			}))
 		})
 	})
+}
+
+// TestStreamWriterWriteKVs writes the same entries, small and large values, in several streams,
+// through Write into one store and through WriteKVs into another: both stores hold the same
+// entries, at the same versions, and stream done marks close the streams alike.
+func TestStreamWriterWriteKVs(t *testing.T) {
+	const streams, perStream = 4, 500
+	kvsOf := func(stream uint32) []*pb.KV {
+		kvs := make([]*pb.KV, 0, perStream+1)
+		for i := range perStream {
+			key := make([]byte, 12)
+			binary.BigEndian.PutUint32(key, stream)
+			binary.BigEndian.PutUint64(key[4:], uint64(i))
+			value := bytes.Repeat([]byte{byte(i)}, 16+i%3*600)
+			kvs = append(kvs, &pb.KV{Key: key, Value: value, Version: uint64(10 + i%7), StreamId: stream, UserMeta: []byte{byte(stream)}})
+		}
+		return append(kvs, &pb.KV{StreamId: stream, StreamDone: true})
+	}
+	entriesOf := func(db *DB) map[string]string {
+		got := map[string]string{}
+		require.NoError(t, db.View(func(txn *Txn) error {
+			it := txn.NewIterator(DefaultIteratorOptions)
+			defer it.Close()
+			for it.Rewind(); it.Valid(); it.Next() {
+				value, err := it.Item().ValueCopy(nil)
+				require.NoError(t, err)
+				got[fmt.Sprintf("%x@%d/%d", it.Item().Key(), it.Item().Version(), it.Item().UserMeta())] = string(value)
+			}
+			return nil
+		}))
+		return got
+	}
+	opts := getTestOptions("")
+	opts.ValueThreshold = 256
+	var written []map[string]string
+	for _, direct := range []bool{false, true} {
+		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
+			sw := db.NewStreamWriter()
+			require.NoError(t, sw.Prepare())
+			var wg sync.WaitGroup
+			for stream := uint32(1); stream <= streams; stream++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					kvs := kvsOf(stream)
+					if direct {
+						require.NoError(t, sw.WriteKVs(kvs))
+						return
+					}
+					buf := z.NewBuffer(1<<20, "test")
+					defer func() { require.NoError(t, buf.Release()) }()
+					for _, kv := range kvs {
+						KVToBuffer(kv, buf)
+					}
+					require.NoError(t, sw.Write(buf))
+				}()
+			}
+			wg.Wait()
+			require.NoError(t, sw.Flush())
+			written = append(written, entriesOf(db))
+		})
+	}
+	require.Len(t, written[0], streams*perStream)
+	require.Equal(t, written[0], written[1])
 }

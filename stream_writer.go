@@ -132,68 +132,96 @@ func (sw *StreamWriter) Write(buf *z.Buffer) error {
 	if buf.LenNoPadding() == 0 {
 		return nil
 	}
-
-	// closedStreams keeps track of all streams which are going to be marked as done. We are
-	// keeping track of all streams so that we can close them at the end, after inserting all
-	// the valid kvs.
-	closedStreams := make(map[uint32]struct{})
-	streamReqs := make(map[uint32]*request)
-
+	b := newStreamBatch()
 	err := buf.SliceIterate(func(s []byte) error {
 		var kv pb.KV
 		if err := proto.Unmarshal(s, &kv); err != nil {
 			return err
 		}
-		if kv.StreamDone {
-			closedStreams[kv.StreamId] = struct{}{}
-			return nil
-		}
-
-		// Panic if some kv comes after stream has been marked as closed.
-		if _, ok := closedStreams[kv.StreamId]; ok {
-			panic(fmt.Sprintf("write performed on closed stream: %d", kv.StreamId))
-		}
-
-		sw.writeLock.Lock()
-		if sw.maxVersion < kv.Version {
-			sw.maxVersion = kv.Version
-		}
-		if sw.prevLevel == 0 {
-			// If prevLevel is 0, that means that we have not written anything yet.
-			// So, we can write to the maxLevel. newWriter writes to prevLevel - 1,
-			// so we can set prevLevel to len(levels).
-			sw.prevLevel = len(sw.db.lc.levels)
-		}
-		sw.writeLock.Unlock()
-
-		var meta, userMeta byte
-		if len(kv.Meta) > 0 {
-			meta = kv.Meta[0]
-		}
-		if len(kv.UserMeta) > 0 {
-			userMeta = kv.UserMeta[0]
-		}
-		e := &Entry{
-			Key:       y.KeyWithTs(kv.Key, kv.Version),
-			Value:     y.Copy(kv.Value),
-			UserMeta:  userMeta,
-			ExpiresAt: kv.ExpiresAt,
-			meta:      meta,
-		}
-		// If the value can be collocated with the key in LSM tree, we can skip
-		// writing the value to value log.
-		req := streamReqs[kv.StreamId]
-		if req == nil {
-			req = &request{}
-			streamReqs[kv.StreamId] = req
-		}
-		req.Entries = append(req.Entries, e)
+		b.add(&kv, true)
 		return nil
 	})
 	if err != nil {
 		return err
 	}
+	return sw.writeBatch(b)
+}
 
+// WriteKVs writes kvs as Write writes the KVs of a buffer, without their encoding into one and
+// decoding out of it: the writer keeps the keys and values of kvs as they are, which must not
+// change until Flush returns. The KVs themselves are not kept. WriteKVs is thread safe and can be
+// called concurrently by multiple goroutines, with Write too.
+func (sw *StreamWriter) WriteKVs(kvs []*pb.KV) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+	b := newStreamBatch()
+	for _, kv := range kvs {
+		b.add(kv, false)
+	}
+	return sw.writeBatch(b)
+}
+
+// streamBatch holds the entries of one Write by stream, the streams it marks done, and the
+// highest version of its entries.
+type streamBatch struct {
+	// closedStreams keeps track of all streams which are going to be marked as done. We are
+	// keeping track of all streams so that we can close them at the end, after inserting all
+	// the valid kvs.
+	closedStreams map[uint32]struct{}
+	streamReqs    map[uint32]*request
+	maxVersion    uint64
+}
+
+func newStreamBatch() *streamBatch {
+	return &streamBatch{closedStreams: make(map[uint32]struct{}), streamReqs: make(map[uint32]*request)}
+}
+
+// add adds kv to the batch, its value copied when copyValue says so.
+func (b *streamBatch) add(kv *pb.KV, copyValue bool) {
+	if kv.StreamDone {
+		b.closedStreams[kv.StreamId] = struct{}{}
+		return
+	}
+
+	// Panic if some kv comes after stream has been marked as closed.
+	if _, ok := b.closedStreams[kv.StreamId]; ok {
+		panic(fmt.Sprintf("write performed on closed stream: %d", kv.StreamId))
+	}
+	b.maxVersion = max(b.maxVersion, kv.Version)
+
+	var meta, userMeta byte
+	if len(kv.Meta) > 0 {
+		meta = kv.Meta[0]
+	}
+	if len(kv.UserMeta) > 0 {
+		userMeta = kv.UserMeta[0]
+	}
+	value := kv.Value
+	if copyValue {
+		value = y.Copy(value)
+	}
+	e := &Entry{
+		Key:       y.KeyWithTs(kv.Key, kv.Version),
+		Value:     value,
+		UserMeta:  userMeta,
+		ExpiresAt: kv.ExpiresAt,
+		meta:      meta,
+	}
+	// If the value can be collocated with the key in LSM tree, we can skip
+	// writing the value to value log.
+	req := b.streamReqs[kv.StreamId]
+	if req == nil {
+		req = &request{}
+		b.streamReqs[kv.StreamId] = req
+	}
+	req.Entries = append(req.Entries, e)
+}
+
+// writeBatch writes the entries of b to the writers of their streams, then closes the streams b
+// marks done.
+func (sw *StreamWriter) writeBatch(b *streamBatch) error {
+	closedStreams, streamReqs := b.closedStreams, b.streamReqs
 	all := make([]*request, 0, len(streamReqs))
 	for _, req := range streamReqs {
 		all = append(all, req)
@@ -201,7 +229,17 @@ func (sw *StreamWriter) Write(buf *z.Buffer) error {
 
 	sw.writeLock.Lock()
 	defer sw.writeLock.Unlock()
-
+	if len(streamReqs) > 0 {
+		if sw.maxVersion < b.maxVersion {
+			sw.maxVersion = b.maxVersion
+		}
+		if sw.prevLevel == 0 {
+			// If prevLevel is 0, that means that we have not written anything yet.
+			// So, we can write to the maxLevel. newWriter writes to prevLevel - 1,
+			// so we can set prevLevel to len(levels).
+			sw.prevLevel = len(sw.db.lc.levels)
+		}
+	}
 	// We are writing all requests to vlog even if some request belongs to already closed stream.
 	// It is safe to do because we are panicking while writing to sorted writer, which will be nil
 	// for closed stream. At restart, stream writer will drop all the data in Prepare function.
