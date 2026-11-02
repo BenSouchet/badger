@@ -111,7 +111,12 @@ func (b *Builder) append(data []byte) {
 	y.AssertTrue(len(data) == copy(dst, data))
 }
 
-const maxAllocatorInitialSz = 256 << 20
+// maxAllocatorInitialSz bounds the first buffer of a builder. Its allocator doubles its buffers as
+// the table grows, so a builder that reaches the table size allocates about what one sized for it
+// at once did, while a builder of a small table no longer allocates, zeroed, twice a table size it
+// never reaches: a stream writer makes a builder per stream, and the bulk load of a store of a few
+// tens of megabytes allocated gigabytes for them.
+const maxAllocatorInitialSz = 8 << 20
 
 // NewTableBuilder makes a new TableBuilder.
 func NewTableBuilder(opts Options) *Builder {
