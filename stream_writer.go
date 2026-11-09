@@ -304,6 +304,8 @@ func (sw *StreamWriter) Flush() error {
 			continue
 		}
 		if err := writer.Done(); err != nil {
+			// The tables already sent are still being written: none outlives the Flush.
+			_ = sw.throttle.Finish()
 			return err
 		}
 	}
@@ -386,6 +388,9 @@ type sortedWriter struct {
 	reqCh    chan *request
 	// Have separate closer for each writer, as it can be closed at any time.
 	closer *z.Closer
+	// err is the first error of the writer: the requests after it are dropped, and Done returns it.
+	// Written by handleRequests alone, read once the closer has waited for it.
+	err error
 }
 
 func (sw *StreamWriter) newWriter(streamID uint32) (*sortedWriter, error) {
@@ -412,6 +417,9 @@ func (w *sortedWriter) handleRequests() {
 	defer w.closer.Done()
 
 	process := func(req *request) {
+		if w.err != nil {
+			return
+		}
 		for i, e := range req.Entries {
 			// If badger is running in InMemory mode, len(req.Ptrs) == 0.
 			var vs y.ValueStruct
@@ -432,7 +440,10 @@ func (w *sortedWriter) handleRequests() {
 				}
 			}
 			if err := w.Add(e.Key, vs); err != nil {
-				panic(err)
+				// A table that could not be written (a disk full, a directory gone) fails the
+				// stream at Flush rather than the process: it ran on a goroutine of the writer.
+				w.err = err
+				return
 			}
 		}
 	}
@@ -499,6 +510,11 @@ func (w *sortedWriter) send(done bool) error {
 // Done is called once we are done writing all keys and valueStructs
 // to sortedWriter. It completes writing current SST to disk.
 func (w *sortedWriter) Done() error {
+	if w.err != nil {
+		w.builder.Close()
+		w.builder = nil
+		return w.err
+	}
 	if w.builder.Empty() {
 		w.builder.Close()
 		// Assign builder as nil, so that underlying memory can be garbage collected.

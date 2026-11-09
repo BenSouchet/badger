@@ -852,3 +852,17 @@ func TestStreamWriterWriteKVs(t *testing.T) {
 	require.Len(t, written[0], streams*perStream)
 	require.Equal(t, written[0], written[1])
 }
+
+// An entry the stream writer cannot add (out of order, or after a table it could not write) fails
+// the stream at Flush: the writer adds on goroutines of its own, where a panic took the whole
+// process down with the database.
+func TestStreamWriterReportsAnEntryItCannotAdd(t *testing.T) {
+	runBadgerTest(t, nil, func(t *testing.T, db *DB) {
+		sw := db.NewStreamWriter()
+		require.NoError(t, sw.Prepare())
+		require.NoError(t, sw.Write(getSortedKVList(16, 100)))
+		// The same keys again: below the last key the writer of the stream added.
+		require.NoError(t, sw.Write(getSortedKVList(16, 100)))
+		require.ErrorContains(t, sw.Flush(), "keys not in sorted order")
+	})
+}
